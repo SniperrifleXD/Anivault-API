@@ -4,7 +4,7 @@ import { inspect } from 'util';
 import * as crypto from 'crypto';
 import * as vm from 'vm';
 import { makeClient, makeAjaxClient } from '../utils/fetch';
-import { cacheGet, cacheSet, sharedCacheGet, sharedCacheSet, withInflight } from '../utils/cache';
+import { cacheGet, cacheSet, withInflight, withSharedInflight } from '../utils/cache';
 
 // ══════════════════════════════════════════════════════════════
 // ANIKOTO.NET — HiAnime/Zoro-style clone
@@ -362,7 +362,7 @@ async function getAnikotoEpisodesByIdUncoalesced(idOrSlug: string): Promise<Anik
 // ══════════════════════════════════════════════════════════════
 
 export async function getAnikotoServers(episodeId: string): Promise<AnikotoServer[]> {
-  return withInflight(`anikoto:servers:${episodeId}`, () => getAnikotoServersUncoalesced(episodeId), 'Anikoto server discovery');
+  return withSharedInflight(`anikoto:servers:${episodeId}`, () => getAnikotoServersUncoalesced(episodeId), SERVER_LIST_CACHE_TTL_SECONDS);
 }
 
 async function getAnikotoServersUncoalesced(episodeId: string): Promise<AnikotoServer[]> {
@@ -375,67 +375,46 @@ async function getAnikotoServersUncoalesced(episodeId: string): Promise<AnikotoS
   const servers: AnikotoServer[] = [];
 
   if (dataIds) {
-    const cacheKey = `anikoto:servers:${slug}:${epNumStr}:${dataIds}`;
-    const cachedServers = await sharedCacheGet<AnikotoServer[]>(cacheKey, SERVER_LIST_CACHE_TTL_SECONDS);
+    const startedAt = Date.now();
+    try {
+      const res = await ajax.get('/ajax/server/list', { params: { servers: dataIds } });
+      const html = res.data?.result || (typeof res.data === 'string' ? res.data : '');
+      const $ = cheerio.load(html);
 
-    if (cachedServers?.length) {
-      servers.push(...cachedServers);
-      log('getAnikotoServers: shared server-list cache hit', {
+      $('.server, li').each((_, el) => {
+        const $el = $(el);
+        const linkId = $el.attr('data-link-id');
+        if (!linkId) return;
+
+        const typeLabel = $el.closest('.type').find('label, .name').text().trim().toLowerCase();
+        const name = $el.text().trim() || 'Server';
+        const svId = $el.attr('data-sv-id') || '';
+        const type: AnikotoServer['type'] =
+          typeLabel.includes('dub') ? 'dub' : typeLabel.includes('raw') ? 'raw' : 'sub';
+
+        servers.push({
+          name,
+          sourceId: `${slug}::${epNumStr}::reg::${linkId}::${svId}::${encodeURIComponent(name)}`,
+          type,
+        });
+      });
+
+      log('getAnikotoServers: /ajax/server/list completed', {
         slug,
         episode: epNumStr,
-        serverCount: cachedServers.length,
+        durationMs: Date.now() - startedAt,
+        serverCount: servers.length,
       });
-    } else {
-      const startedAt = Date.now();
-      const discovered: AnikotoServer[] = [];
-      try {
-        const res = await ajax.get('/ajax/server/list', { params: { servers: dataIds } });
-        const html = res.data?.result || (typeof res.data === 'string' ? res.data : '');
-        const $ = cheerio.load(html);
-
-        $('.server, li').each((_, el) => {
-          const $el = $(el);
-          const linkId = $el.attr('data-link-id');
-          if (!linkId) return;
-
-          const typeLabel = $el.closest('.type').find('label, .name').text().trim().toLowerCase();
-          const name = $el.text().trim() || 'Server';
-          const svId = $el.attr('data-sv-id') || '';
-          const type: AnikotoServer['type'] =
-            typeLabel.includes('dub') ? 'dub' : typeLabel.includes('raw') ? 'raw' : 'sub';
-
-          discovered.push({
-            name,
-            sourceId: `${slug}::${epNumStr}::reg::${linkId}::${svId}::${encodeURIComponent(name)}`,
-            type,
-          });
-        });
-
-        log('getAnikotoServers: /ajax/server/list completed', {
-          slug,
-          episode: epNumStr,
-          durationMs: Date.now() - startedAt,
-          serverCount: discovered.length,
-        });
-        if (discovered.length === 0) {
-          log('getAnikotoServers: /ajax/server/list returned no parseable .server/li elements', { slug, dataIds, htmlSnippet: String(html).slice(0, 300) });
-        } else {
-          await sharedCacheSet(cacheKey, discovered, SERVER_LIST_CACHE_TTL_SECONDS);
-          servers.push(...discovered);
-          log('getAnikotoServers: shared server-list cache populated', {
-            slug,
-            episode: epNumStr,
-            ttlSeconds: SERVER_LIST_CACHE_TTL_SECONDS,
-          });
-        }
-      } catch (err) {
-        log('getAnikotoServers: /ajax/server/list threw', {
-          slug,
-          dataIds,
-          durationMs: Date.now() - startedAt,
-          ...errInfo(err),
-        });
+      if (servers.length === 0) {
+        log('getAnikotoServers: /ajax/server/list returned no parseable .server/li elements', { slug, dataIds, htmlSnippet: String(html).slice(0, 300) });
       }
+    } catch (err) {
+      log('getAnikotoServers: /ajax/server/list threw', {
+        slug,
+        dataIds,
+        durationMs: Date.now() - startedAt,
+        ...errInfo(err),
+      });
     }
   }
 
