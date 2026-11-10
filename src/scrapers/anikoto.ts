@@ -232,7 +232,11 @@ interface RawEpisode {
   slug?: string;
 }
 
-async function fetchRawEpisodes(slug: string): Promise<RawEpisode[]> {\n  return withInflight(`anikoto:episodes:slug:${slug}`, () => fetchRawEpisodesUncoalesced(slug), `Anikoto episode list slug=${slug}`);\n}\n\nasync function fetchRawEpisodesUncoalesced(slug: string): Promise<RawEpisode[]> {
+async function fetchRawEpisodes(slug: string): Promise<RawEpisode[]> {
+  return withInflight(`anikoto:episodes:slug:${slug}`, () => fetchRawEpisodesUncoalesced(slug), `Anikoto episode list slug=${slug}`);
+}
+
+async function fetchRawEpisodesUncoalesced(slug: string): Promise<RawEpisode[]> {
   const cacheKey = `anikoto:eps:${slug}`;
   const cached = cacheGet<RawEpisode[]>(cacheKey);
   if (cached) return cached;
@@ -295,7 +299,11 @@ export async function getAnikotoEpisodes(slug: string): Promise<AnikotoEpisode[]
 // Resolve episodes from Anikoto's own numeric anime ID without first resolving
 // a MAL/AniList title. The ID is the data-id attached to #watch-main and is
 // accepted directly by Anikoto's /ajax/episode/list/:id endpoint.
-export async function getAnikotoEpisodesById(idOrSlug: string): Promise<AnikotoEpisode[]> {\n  const identifier = String(idOrSlug || '').trim();\n  if (!identifier) return [];\n  return withInflight(`anikoto:episodes:id:${identifier}`, () => getAnikotoEpisodesByIdUncoalesced(identifier), `Anikoto episode list id=${identifier}`);\n}\n\nasync function getAnikotoEpisodesByIdUncoalesced(idOrSlug: string): Promise<AnikotoEpisode[]> {
+export async function getAnikotoEpisodesById(idOrSlug: string): Promise<AnikotoEpisode[]> {
+  const identifier = String(idOrSlug || '').trim();\n  if (!identifier) return [];\n  return withInflight(`anikoto:episodes:id:${identifier}`, () => getAnikotoEpisodesByIdUncoalesced(identifier), `Anikoto episode list id=${identifier}`);
+}
+
+async function getAnikotoEpisodesByIdUncoalesced(idOrSlug: string): Promise<AnikotoEpisode[]> {
   const identifier = String(idOrSlug || '').trim();
   if (!identifier) return [];
   if (!/^\d+$/.test(identifier)) return getAnikotoEpisodes(identifier);
@@ -350,7 +358,11 @@ export async function getAnikotoEpisodesById(idOrSlug: string): Promise<AnikotoE
 // SERVER LIST
 // ══════════════════════════════════════════════════════════════
 
-export async function getAnikotoServers(episodeId: string): Promise<AnikotoServer[]> {\n  return withInflight(`anikoto:servers:${episodeId}`, () => getAnikotoServersUncoalesced(episodeId), 'Anikoto server discovery');\n}\n\nasync function getAnikotoServersUncoalesced(episodeId: string): Promise<AnikotoServer[]> {
+export async function getAnikotoServers(episodeId: string): Promise<AnikotoServer[]> {
+  return withInflight(`anikoto:servers:${episodeId}`, () => getAnikotoServersUncoalesced(episodeId), 'Anikoto server discovery');
+}
+
+async function getAnikotoServersUncoalesced(episodeId: string): Promise<AnikotoServer[]> {
   const [slug, epNumStr, dataIds, dataMal, dataTimestamp] = episodeId.split('::');
   if (!slug || !epNumStr) {
     log('getAnikotoServers: malformed episodeId', episodeId);
