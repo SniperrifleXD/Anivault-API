@@ -4,7 +4,7 @@ import { inspect } from 'util';
 import * as crypto from 'crypto';
 import * as vm from 'vm';
 import { makeClient, makeAjaxClient } from '../utils/fetch';
-import { cacheGet, cacheSet, withInflight } from '../utils/cache';
+import { cacheGet, cacheSet, withInflight, withSharedInflight } from '../utils/cache';
 
 // ══════════════════════════════════════════════════════════════
 // ANIKOTO.NET — HiAnime/Zoro-style clone
@@ -20,6 +20,7 @@ import { cacheGet, cacheSet, withInflight } from '../utils/cache';
 // listed among Anikoto's verified domains and caused every search/AJAX lookup to miss.
 // Set ANIKOTO_BASE_URL to an official mirror if the primary domain is unavailable.
 const BASE = (process.env.ANIKOTO_BASE_URL || 'https://anikototv.to').replace(/\/+$/, '');
+const SERVER_LIST_CACHE_TTL_SECONDS = Math.max(30, parseInt(process.env.CACHE_TTL_SERVER_LIST || '900', 10) || 900);
 const http = makeClient(BASE, BASE + '/');
 const ajax = makeAjaxClient(BASE, BASE + '/');
 
@@ -361,7 +362,7 @@ async function getAnikotoEpisodesByIdUncoalesced(idOrSlug: string): Promise<Anik
 // ══════════════════════════════════════════════════════════════
 
 export async function getAnikotoServers(episodeId: string): Promise<AnikotoServer[]> {
-  return withInflight(`anikoto:servers:${episodeId}`, () => getAnikotoServersUncoalesced(episodeId), 'Anikoto server discovery');
+  return withSharedInflight(`anikoto:servers:${episodeId}`, () => getAnikotoServersUncoalesced(episodeId), SERVER_LIST_CACHE_TTL_SECONDS);
 }
 
 async function getAnikotoServersUncoalesced(episodeId: string): Promise<AnikotoServer[]> {
@@ -551,20 +552,28 @@ async function resolveKiwi(malId: string, epNum: string, timestamp: string, type
         }
       }
 
-      // Path B: no valid server code, but a direct URL was found (e.g. the
-      // `download` shortlink) — run it through the normal extractor chain in
-      // case it happens to resolve to a known megacloud/megaplay host.
+      // Kiwi's current mapper response exposes AnimePahe download shortlinks,
+      // not playable embed URLs. pahe.nekostream.site hands off to testpahe and
+      // then a Kwik file page; that flow requires a browser/Cloudflare clearance
+      // and a CSRF form POST. Do not feed a download URL into video embed extractors.
       if (directUrl) {
-        log('kiwi: no valid server code, trying direct link through extractor chain', { directUrl });
-        const resolved = await resolveAnikotoEmbed(directUrl, 'Kiwi Stream').catch((err) => {
-          log('kiwi: direct link resolution threw', errInfo(err));
-          return null;
-        });
-        if (resolved) {
-          log(`kiwi: resolved via ${mapperBase} (direct-link path)`, { directUrl, m3u8: resolved.m3u8 });
-          return resolved;
+        if (directUrl.includes('nekostream.site')) {
+          log('kiwi: mapper returned a download-only AnimePahe shortlink; it is not a playable stream URL', {
+            directUrl,
+            resolution: 'requires the separate Kwik download flow and browser clearance',
+          });
+        } else {
+          log('kiwi: no valid server code, trying non-Kiwi direct URL through extractor chain', { directUrl });
+          const resolved = await resolveAnikotoEmbed(directUrl, 'Kiwi Stream').catch((err) => {
+            log('kiwi: direct link resolution threw', errInfo(err));
+            return null;
+          });
+          if (resolved) {
+            log(`kiwi: resolved via ${mapperBase} (direct-link path)`, { directUrl, m3u8: resolved.m3u8 });
+            return resolved;
+          }
+          log('kiwi: direct link did not resolve via any known extractor', { directUrl });
         }
-        log('kiwi: direct link did not resolve via any known extractor', { directUrl });
       }
 
       if (!serverCode && !directUrl) {
