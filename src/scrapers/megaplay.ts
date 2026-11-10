@@ -1,5 +1,5 @@
 import axios from 'axios';
-import { resolveMegaPlayPlayer } from './anikoto';
+import { resolveMegaPlayPlayerFromHtml } from './anikoto';
 
 export interface MegaPlayStream {
   embedUrl: string;
@@ -40,9 +40,9 @@ export async function getMegaPlayStream(
     const html = typeof response.data === 'string' ? response.data : '';
     if (!html || !/<html|<iframe|<title/i.test(html)) return null;
 
-    // The shared extractor fetches the player itself and decrypts the returned
-    // sources.enc payload, including any required playback URL token.
-    const stream = await resolveMegaPlayPlayer(finalUrl);
+    // Reuse the player HTML fetched above while decrypting the sources.enc payload
+    // and generating any required playback URL token.
+    const stream = await resolveMegaPlayPlayerFromHtml(finalUrl, html);
     if (!stream) return null;
     return { ...stream, embedUrl: stream.embedUrl || finalUrl };
   } catch (error: any) {
