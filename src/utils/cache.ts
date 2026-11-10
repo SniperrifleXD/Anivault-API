@@ -1,4 +1,5 @@
 import NodeCache from 'node-cache';
+import { randomUUID } from 'crypto';
 
 const cache = new NodeCache({ useClones: false });
 
@@ -106,4 +107,97 @@ export async function withInflight<T>(
       inFlight.delete(key);
     }
   }
+}
+
+
+// Distributed single-flight for cacheable work. A short Redis lock prevents
+// separate serverless instances from all performing the same cold lookup.
+export async function withSharedInflight<T>(
+  key: string,
+  task: () => Promise<T>,
+  ttlSeconds = 900,
+  waitMs = 6000,
+): Promise<T> {
+  return withInflight(`shared:${key}`, async () => {
+    const cached = await sharedCacheGet<T>(key, ttlSeconds);
+    if (cached !== null) {
+      console.info(`[inflight] shared cache hit ${key}`);
+      return cached;
+    }
+
+    // Without Redis, retain the existing process-local behavior and cache the
+    // result locally. Redis failures also fall back to this safe path.
+    if (!redisUrl || !redisToken) {
+      const result = await task();
+      if (!(Array.isArray(result) && result.length === 0)) {
+        await sharedCacheSet(key, result, ttlSeconds);
+      }
+      return result;
+    }
+
+    const lockKey = `${key}:lock`;
+    const token = randomUUID();
+    let acquired = false;
+
+    try {
+      const response = await fetch(`${redisUrl}/set/${encodeURIComponent(lockKey)}?nx&px=15000`, {
+        method: 'POST',
+        headers: redisHeaders(),
+        body: token,
+        signal: AbortSignal.timeout(2500),
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const payload = await response.json() as { result?: unknown };
+      acquired = payload.result === 'OK';
+    } catch (error) {
+      console.warn('[cache] shared lock failed; continuing without distributed coordination', error instanceof Error ? error.message : error);
+      const result = await task();
+      if (!(Array.isArray(result) && result.length === 0)) {
+        await sharedCacheSet(key, result, ttlSeconds);
+      }
+      return result;
+    }
+
+    if (!acquired) {
+      const deadline = Date.now() + waitMs;
+      while (Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        const result = await sharedCacheGet<T>(key, ttlSeconds);
+        if (result !== null) return result;
+      }
+
+      console.warn(`[cache] shared lock wait timed out for ${key}; allowing a fallback lookup`);
+      const result = await task();
+      if (!(Array.isArray(result) && result.length === 0)) {
+        await sharedCacheSet(key, result, ttlSeconds);
+      }
+      return result;
+    }
+
+    try {
+      // Recheck after acquiring the lock in case another instance populated
+      // the cache between our first GET and the successful SET NX.
+      const secondCheck = await sharedCacheGet<T>(key, ttlSeconds);
+      if (secondCheck !== null) return secondCheck;
+
+      const result = await task();
+      if (!(Array.isArray(result) && result.length === 0)) {
+        await sharedCacheSet(key, result, ttlSeconds);
+      }
+      return result;
+    } finally {
+      // Compare-and-delete prevents this invocation from releasing a newer
+      // lock if its own lock expired while the upstream request was running.
+      const script = "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end";
+      try {
+        const response = await fetch(
+          `${redisUrl}/eval/${encodeURIComponent(script)}/1/${encodeURIComponent(lockKey)}/${encodeURIComponent(token)}`,
+          { headers: redisHeaders(), signal: AbortSignal.timeout(2500) },
+        );
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      } catch (error) {
+        console.warn('[cache] shared lock release failed', error instanceof Error ? error.message : error);
+      }
+    }
+  }, `shared operation ${key}`);
 }
