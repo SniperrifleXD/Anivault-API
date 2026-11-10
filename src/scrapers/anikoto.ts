@@ -1112,7 +1112,7 @@ export async function getAnikotoEmbedUrl(sourceId: string): Promise<AnikotoStrea
 }
 
 
- // Resolve a MegaPlay player page that the caller has already fetched.
+// Resolve a MegaPlay player page that the caller has already fetched.
 // This avoids requesting the exact same player HTML a second time.
 export async function resolveMegaPlayPlayerFromHtml(playerUrl: string, html: string) {
   try {
