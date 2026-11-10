@@ -1083,7 +1083,16 @@ export async function getAnikotoEmbedUrl(sourceId: string): Promise<AnikotoStrea
     const isVidstreamLike = lower.includes('vidstream') || lower.includes('vidplay') || lower.includes('vid-');
 
     let result: AnikotoStream | null = null;
-    if (isVidstreamLike) {
+    const embedHostname = (() => {
+      try { return new URL(embedUrl).hostname.toLowerCase(); } catch { return ''; }
+    })();
+    const isAlreadyMegaPlay = ['megaplay.buzz', 'vidwish.live', 'vidtube.site'].some(
+      (host) => embedHostname === host || embedHostname.endsWith(`.${host}`)
+    );
+
+    // Anikoto may label MegaPlay embeds as Vidstream. The Vidstream-specific
+    // resolver cannot handle these hosts and only adds a redundant request.
+    if (isVidstreamLike && !isAlreadyMegaPlay) {
       result = await resolveVidstream(embedUrl, epReferer).catch((err) => {
         log('getAnikotoEmbedUrl: resolveVidstream threw unexpectedly', errInfo(err));
         return null;
@@ -1102,6 +1111,26 @@ export async function getAnikotoEmbedUrl(sourceId: string): Promise<AnikotoStrea
   }
 }
 
+
+ // Resolve a MegaPlay player page that the caller has already fetched.
+// This avoids requesting the exact same player HTML a second time.
+export async function resolveMegaPlayPlayerFromHtml(playerUrl: string, html: string) {
+  try {
+    const url = new URL(playerUrl);
+    const hostname = url.hostname.toLowerCase();
+    const knownMegaPlayHost = ['megaplay.buzz', 'vidwish.live', 'vidtube.site'].some(
+      (host) => hostname === host || hostname.endsWith(`.${host}`)
+    );
+    if (knownMegaPlayHost) {
+      return doMegaplay(url.host, html, `${url.origin}/`, 'MegaPlay Direct');
+    }
+  } catch (err) {
+    log('resolveMegaPlayPlayerFromHtml: invalid player URL', { playerUrl, ...errInfo(err) });
+    return null;
+  }
+  // Preserve the existing redirect/iframe resolver for unexpected hosts.
+  return resolveAnikotoEmbed(playerUrl, 'MegaPlay Direct');
+}
 
 // Public entry point for MegaPlay's direct ID endpoints. The endpoint returns a
 // player page, not a stream URL; reuse the existing MegaPlay player extractor
