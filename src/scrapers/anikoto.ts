@@ -193,7 +193,16 @@ export async function findAnikotoSlug(title: string): Promise<string | null> {
   if (!unique.length) return null;
 
   const ranked = unique
-    .map((result) => ({ result, score: scoreTitle(title, result.title) }))
+    .map((result) => ({
+      result,
+      // Anikoto exposes the Japanese/romaji title separately through data-jp.
+      // Score both names so an exact alternate-title match is not discarded
+      // just because the visible English title uses different season wording.
+      score: Math.max(
+        scoreTitle(title, result.title),
+        result.japaneseTitle ? scoreTitle(title, result.japaneseTitle) : 0
+      ),
+    }))
     .filter((entry) => entry.score >= 75)
     .sort((a, b) => b.score - a.score);
 
