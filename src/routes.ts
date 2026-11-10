@@ -19,6 +19,12 @@ const router = Router();
 const SOURCES = ['animeheaven', 'anikoto', 'desidub', 'megaplay'] as const;
 type Source = typeof SOURCES[number];
 
+function setEdgeCache(res: Response, maxAgeSeconds: number, staleSeconds: number): void {
+  // Cache only public, deterministic GET responses at the Vercel edge.
+  // Stream URLs are intentionally excluded because their signatures expire.
+  res.setHeader('Cache-Control', `public, max-age=0, s-maxage=${maxAgeSeconds}, stale-while-revalidate=${staleSeconds}`);
+}
+
 function publicBase(req: Request): string {
   const proto = (req.headers['x-forwarded-proto'] as string | undefined)?.split(',')[0] || req.protocol;
   return `${proto}://${req.get('host')}`;
@@ -176,6 +182,7 @@ router.get('/info', async (req: Request, res: Response) => {
     const anikoto = await fetchEpisodes('anikoto', info);
     const episodeCount = anikoto.error ? null : anikoto.episodes.length;
 
+    setEdgeCache(res, 600, 1800);
     return res.json({
       anilistId: info.anilistId,
       malId: info.malId,
@@ -199,13 +206,15 @@ router.get('/episodes', async (req: Request, res: Response) => {
   try {
     if (source === 'animeheaven' && heavenId && !anilistId && !malId) {
       const episodes = await getHeavenEpisodes(String(heavenId));
-      return res.json({ anilistId: null, malId: null, title: null, source, siteId: String(heavenId), count: episodes.length, episodes });
+      setEdgeCache(res, 300, 900);
+    return res.json({ anilistId: null, malId: null, title: null, source, siteId: String(heavenId), count: episodes.length, episodes });
     }
 
     const siteIds = await resolveSiteIds(anilistId as string, malId as string, source as Source);
     if (!siteIds) return res.status(404).json({ error: 'Could not resolve site IDs' });
     const result = await fetchEpisodes(source as Source, siteIds, { heavenId: heavenId ? String(heavenId) : undefined });
     if (result.error) return res.status(404).json({ error: result.error });
+    setEdgeCache(res, 300, 900);
     return res.json({ anilistId: siteIds.anilistId, malId: siteIds.malId, title: siteIds.title, source, siteId: result.siteId, count: result.episodes.length, episodes: result.episodes });
   } catch (e) {
     return res.status(500).json({ error: String(e) });
@@ -240,6 +249,7 @@ router.get('/servers/v2', async (req: Request, res: Response) => {
 
     const allServers = await getAnikotoServers(episode.id);
     const servers = type === 'all' ? allServers : allServers.filter((server) => server.type === type);
+    setEdgeCache(res, 60, 300);
     return res.json({
       animeId: anikotoId,
       siteId: anikotoId,
@@ -363,6 +373,7 @@ router.get('/servers', async (req: Request, res: Response) => {
     }
 
     const filtered = type === 'all' ? allServers : allServers.filter((s: any) => s.type === type);
+    setEdgeCache(res, 60, 300);
     return res.json({
       anilistId: siteIds.anilistId,
       malId: siteIds.malId,
