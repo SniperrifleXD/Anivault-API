@@ -2,7 +2,7 @@ import { Router, Request, Response } from 'express';
 import axios from 'axios';
 import https from 'https';
 import { malToAnilist, getSiteIds, getSiteIdsByMal, searchAnilist, SiteIds } from './utils/mapper';
-import { cacheStats } from './utils/cache';
+import { cacheStats, withInflight } from './utils/cache';
 import { resolveEmbed } from './resolvers/megacloud';
 
 import { getHeavenEpisodes, getHeavenServers, getHeavenStream } from './scrapers/animeheaven';
@@ -96,13 +96,16 @@ async function resolveAlId(anilistId?: string, malId?: string): Promise<number |
 // down/unreachable and we only have a malId, falls back to the MAL-only
 // path so search -> info -> episodes keeps working end to end.
 async function resolveSiteIds(anilistId?: string, malId?: string): Promise<SiteIds | null> {
-  const alId = await resolveAlId(anilistId, malId);
-  if (alId) {
-    const info = await getSiteIds(alId);
-    if (info) return info;
-  }
-  if (malId) return getSiteIdsByMal(parseInt(malId));
-  return null;
+  const key = `siteids:resolve:${anilistId || ''}:${malId || ''}`;
+  return withInflight(key, async () => {
+    const alId = await resolveAlId(anilistId, malId);
+    if (alId) {
+      const info = await getSiteIds(alId);
+      if (info) return info;
+    }
+    if (malId) return getSiteIdsByMal(parseInt(malId));
+    return null;
+  }, 'site ID mapping');
 }
 
 async function fetchEpisodes(source: Source, siteIds: any, overrides: { heavenId?: string } = {}): Promise<{ episodes: any[]; siteId: string; error?: string }> {
@@ -305,6 +308,7 @@ async function buildAnikotoDebug(siteIds: any, malId?: string) {
 }
 
 router.get('/servers', async (req: Request, res: Response) => {
+  const requestStartedAt = Date.now();
   const { anilistId, malId, ep, type = 'sub', source = 'anikoto', heavenId, providerAnimeId, episodeId, episodeSession } = req.query;
   if (!ep) return res.status(400).json({ error: 'Missing ?ep=' });
   if (!anilistId && !malId && !(source === 'animeheaven' && heavenId)) return res.status(400).json({ error: 'Provide ?anilistId= or ?malId=, or ?heavenId= for AnimeHeaven' });
@@ -316,9 +320,25 @@ router.get('/servers', async (req: Request, res: Response) => {
     const siteIds = heavenId && source === 'animeheaven'
       ? { anilistId: null, malId: null, title: null, siteIds: { animeheaven: String(heavenId) } }
       : await resolveSiteIds(anilistId as string, malId as string);
+    if (source === 'anikoto') {
+      console.info('[servers] site ID mapping completed', {
+        durationMs: Date.now() - requestStartedAt,
+        anilistId: siteIds?.anilistId ?? anilistId ?? null,
+        malId: siteIds?.malId ?? malId ?? null,
+        found: Boolean(siteIds),
+      });
+    }
     if (!siteIds) return res.status(404).json({ error: 'Could not resolve site IDs' });
 
+    const episodeLookupStartedAt = Date.now();
     const epResult = await fetchEpisodes(source as Source, siteIds, { heavenId: heavenId ? String(heavenId) : undefined });
+    if (source === 'anikoto') {
+      console.info('[servers] episode lookup completed', {
+        durationMs: Date.now() - episodeLookupStartedAt,
+        episodeCount: epResult.episodes.length,
+        found: !epResult.error,
+      });
+    }
     if (epResult.error) {
       const debug = req.query.debug === '1' && source === 'anikoto'
         ? await buildAnikotoDebug(siteIds, malId as string | undefined)
@@ -329,10 +349,18 @@ router.get('/servers', async (req: Request, res: Response) => {
     if (!episode) return res.status(404).json({ error: `Episode ${epNum} not found` });
 
     let allServers: any[] = [];
+    const serverLookupStartedAt = Date.now();
     if (source === 'animeheaven') allServers = await getHeavenServers(episode.id, `https://animeheaven.me/anime.php?${epResult.siteId}`);
     if (source === 'anikoto') allServers = await getAnikotoServers(episode.id);
     if (source === 'desidub') allServers = await getDesidubServers(episode.id);
     if (source === 'megaplay') allServers = [{ name: 'MegaPlay Direct', sourceId: String(epNum), type: type === 'dub' ? 'dub' : 'sub' }];
+    if (source === 'anikoto') {
+      console.info('[servers] server discovery completed', {
+        durationMs: Date.now() - serverLookupStartedAt,
+        serverCount: allServers.length,
+        totalDurationMs: Date.now() - requestStartedAt,
+      });
+    }
 
     const filtered = type === 'all' ? allServers : allServers.filter((s: any) => s.type === type);
     return res.json({

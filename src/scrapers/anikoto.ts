@@ -4,7 +4,7 @@ import { inspect } from 'util';
 import * as crypto from 'crypto';
 import * as vm from 'vm';
 import { makeClient, makeAjaxClient } from '../utils/fetch';
-import { cacheGet, cacheSet } from '../utils/cache';
+import { cacheGet, cacheSet, withInflight } from '../utils/cache';
 
 // ══════════════════════════════════════════════════════════════
 // ANIKOTO.NET — HiAnime/Zoro-style clone
@@ -233,6 +233,10 @@ interface RawEpisode {
 }
 
 async function fetchRawEpisodes(slug: string): Promise<RawEpisode[]> {
+  return withInflight(`anikoto:episodes:slug:${slug}`, () => fetchRawEpisodesUncoalesced(slug), `Anikoto episode list slug=${slug}`);
+}
+
+async function fetchRawEpisodesUncoalesced(slug: string): Promise<RawEpisode[]> {
   const cacheKey = `anikoto:eps:${slug}`;
   const cached = cacheGet<RawEpisode[]>(cacheKey);
   if (cached) return cached;
@@ -298,6 +302,12 @@ export async function getAnikotoEpisodes(slug: string): Promise<AnikotoEpisode[]
 export async function getAnikotoEpisodesById(idOrSlug: string): Promise<AnikotoEpisode[]> {
   const identifier = String(idOrSlug || '').trim();
   if (!identifier) return [];
+  return withInflight(`anikoto:episodes:id:${identifier}`, () => getAnikotoEpisodesByIdUncoalesced(identifier), `Anikoto episode list id=${identifier}`);
+}
+
+async function getAnikotoEpisodesByIdUncoalesced(idOrSlug: string): Promise<AnikotoEpisode[]> {
+  const identifier = String(idOrSlug || '').trim();
+  if (!identifier) return [];
   if (!/^\d+$/.test(identifier)) return getAnikotoEpisodes(identifier);
 
   const cacheKey = `anikoto:eps:id:${identifier}`;
@@ -351,6 +361,10 @@ export async function getAnikotoEpisodesById(idOrSlug: string): Promise<AnikotoE
 // ══════════════════════════════════════════════════════════════
 
 export async function getAnikotoServers(episodeId: string): Promise<AnikotoServer[]> {
+  return withInflight(`anikoto:servers:${episodeId}`, () => getAnikotoServersUncoalesced(episodeId), 'Anikoto server discovery');
+}
+
+async function getAnikotoServersUncoalesced(episodeId: string): Promise<AnikotoServer[]> {
   const [slug, epNumStr, dataIds, dataMal, dataTimestamp] = episodeId.split('::');
   if (!slug || !epNumStr) {
     log('getAnikotoServers: malformed episodeId', episodeId);
@@ -360,6 +374,7 @@ export async function getAnikotoServers(episodeId: string): Promise<AnikotoServe
   const servers: AnikotoServer[] = [];
 
   if (dataIds) {
+    const startedAt = Date.now();
     try {
       const res = await ajax.get('/ajax/server/list', { params: { servers: dataIds } });
       const html = res.data?.result || (typeof res.data === 'string' ? res.data : '');
@@ -383,11 +398,22 @@ export async function getAnikotoServers(episodeId: string): Promise<AnikotoServe
         });
       });
 
+      log('getAnikotoServers: /ajax/server/list completed', {
+        slug,
+        episode: epNumStr,
+        durationMs: Date.now() - startedAt,
+        serverCount: servers.length,
+      });
       if (servers.length === 0) {
         log('getAnikotoServers: /ajax/server/list returned no parseable .server/li elements', { slug, dataIds, htmlSnippet: String(html).slice(0, 300) });
       }
     } catch (err) {
-      log('getAnikotoServers: /ajax/server/list threw', { slug, dataIds, ...errInfo(err) });
+      log('getAnikotoServers: /ajax/server/list threw', {
+        slug,
+        dataIds,
+        durationMs: Date.now() - startedAt,
+        ...errInfo(err),
+      });
     }
   }
 
