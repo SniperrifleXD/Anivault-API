@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express';
 import axios from 'axios';
 import https from 'https';
-import { malToAnilist, getSiteIds, getSiteIdsByMal, searchAnilist, SiteIds } from './utils/mapper';
+import { malToAnilist, getSiteIds, getSiteIdsByMal, searchAnilist, SiteIds, MappingSource } from './utils/mapper';
 import { cacheStats, withInflight } from './utils/cache';
 import { resolveEmbed } from './resolvers/megacloud';
 
@@ -95,15 +95,15 @@ async function resolveAlId(anilistId?: string, malId?: string): Promise<number |
 // (richer data: zoro/gogoanime via Anify); if AniList is
 // down/unreachable and we only have a malId, falls back to the MAL-only
 // path so search -> info -> episodes keeps working end to end.
-async function resolveSiteIds(anilistId?: string, malId?: string): Promise<SiteIds | null> {
-  const key = `siteids:resolve:${anilistId || ''}:${malId || ''}`;
+async function resolveSiteIds(anilistId?: string, malId?: string, source?: Source): Promise<SiteIds | null> {
+  const key = `siteids:resolve:${anilistId || ''}:${malId || ''}:${source || 'all'}`;
   return withInflight(key, async () => {
     const alId = await resolveAlId(anilistId, malId);
     if (alId) {
-      const info = await getSiteIds(alId);
+      const info = await getSiteIds(alId, source as MappingSource | undefined);
       if (info) return info;
     }
-    if (malId) return getSiteIdsByMal(parseInt(malId));
+    if (malId) return getSiteIdsByMal(parseInt(malId), source as MappingSource | undefined);
     return null;
   }, 'site ID mapping');
 }
@@ -202,7 +202,7 @@ router.get('/episodes', async (req: Request, res: Response) => {
       return res.json({ anilistId: null, malId: null, title: null, source, siteId: String(heavenId), count: episodes.length, episodes });
     }
 
-    const siteIds = await resolveSiteIds(anilistId as string, malId as string);
+    const siteIds = await resolveSiteIds(anilistId as string, malId as string, source as Source);
     if (!siteIds) return res.status(404).json({ error: 'Could not resolve site IDs' });
     const result = await fetchEpisodes(source as Source, siteIds, { heavenId: heavenId ? String(heavenId) : undefined });
     if (result.error) return res.status(404).json({ error: result.error });
@@ -319,7 +319,7 @@ router.get('/servers', async (req: Request, res: Response) => {
   try {
     const siteIds = heavenId && source === 'animeheaven'
       ? { anilistId: null, malId: null, title: null, siteIds: { animeheaven: String(heavenId) } }
-      : await resolveSiteIds(anilistId as string, malId as string);
+      : await resolveSiteIds(anilistId as string, malId as string, source as Source);
     if (source === 'anikoto') {
       console.info('[servers] site ID mapping completed', {
         durationMs: Date.now() - requestStartedAt,
@@ -400,7 +400,7 @@ async function watchHandler(req: Request, res: Response, directAnikotoId?: strin
       ? { anilistId: null, malId: null, title: null, siteIds: { anikoto: directAnikotoId } }
       : directHeavenId
         ? { anilistId: null, malId: null, title: null, siteIds: { animeheaven: id } }
-        : await resolveSiteIds(anilistId, malId);
+        : await resolveSiteIds(anilistId, malId, source as Source);
     if (!siteIds) return res.status(404).json({ error: 'Could not resolve anime' });
 
     if (source === 'megaplay') {
