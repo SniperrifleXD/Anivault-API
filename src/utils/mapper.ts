@@ -114,15 +114,22 @@ async function getAnilistTitle(anilistId: number): Promise<{ title: string; altT
 // Enrich only the provider requested by a playback route. The no-source
 // path intentionally keeps the legacy full mapping behavior used by /info.
 async function enrichForSource(result: SiteIds, source?: MappingSource): Promise<SiteIds> {
-  if (!source || source === 'animeheaven') {
+  if (source === 'animeheaven') {
     await enrichAnimeHeaven(result, result.altTitle);
-  }
-  if (!source || source === 'anikoto') {
+  } else if (source === 'anikoto') {
     await enrichAnikoto(result, result.altTitle);
-  }
-  if (!source || source === 'desidub') {
+  } else if (source === 'desidub') {
     await enrichDesidub(result, result.altTitle);
+  } else if (!source) {
+    // The legacy full-mapping path has independent provider lookups. Run
+    // them concurrently rather than serializing three unrelated scrapers.
+    await Promise.all([
+      enrichAnimeHeaven(result, result.altTitle),
+      enrichAnikoto(result, result.altTitle),
+      enrichDesidub(result, result.altTitle),
+    ]);
   }
+  // MegaPlay needs only AniList/MAL metadata, not a site slug.
   return result;
 }
 
