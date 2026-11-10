@@ -480,7 +480,16 @@ async function watchHandler(req: Request, res: Response, directAnikotoId?: strin
     for (const server of candidates) {
       let raw: any = null;
       if (source === 'animeheaven') raw = await getHeavenStream(server.sourceId, server.referer);
-      if (source === 'anikoto') raw = await getAnikotoEmbedUrl(server.sourceId);
+      if (source === 'anikoto') {
+        // Multiple clients can request the same episode/server at once. Share
+        // the pending extraction within this instance instead of repeating the
+        // mapper, embed-page, and MegaPlay requests for the same source ID.
+        raw = await withInflight(
+          `anikoto:stream:${server.sourceId}`,
+          () => getAnikotoEmbedUrl(server.sourceId),
+          `Anikoto stream ${server.name}`,
+        );
+      }
       if (source === 'desidub') raw = await getDesidubStream(server.sourceId);
       if (raw) { embedResult = raw; usedServer = server.name; break; }
     }
