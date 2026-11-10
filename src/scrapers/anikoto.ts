@@ -300,7 +300,9 @@ export async function getAnikotoEpisodes(slug: string): Promise<AnikotoEpisode[]
 // a MAL/AniList title. The ID is the data-id attached to #watch-main and is
 // accepted directly by Anikoto's /ajax/episode/list/:id endpoint.
 export async function getAnikotoEpisodesById(idOrSlug: string): Promise<AnikotoEpisode[]> {
-  const identifier = String(idOrSlug || '').trim();\n  if (!identifier) return [];\n  return withInflight(`anikoto:episodes:id:${identifier}`, () => getAnikotoEpisodesByIdUncoalesced(identifier), `Anikoto episode list id=${identifier}`);
+  const identifier = String(idOrSlug || '').trim();
+  if (!identifier) return [];
+  return withInflight(`anikoto:episodes:id:${identifier}`, () => getAnikotoEpisodesByIdUncoalesced(identifier), `Anikoto episode list id=${identifier}`);
 }
 
 async function getAnikotoEpisodesByIdUncoalesced(idOrSlug: string): Promise<AnikotoEpisode[]> {
