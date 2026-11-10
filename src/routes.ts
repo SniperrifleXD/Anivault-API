@@ -2,7 +2,7 @@ import { Router, Request, Response } from 'express';
 import axios from 'axios';
 import https from 'https';
 import { malToAnilist, getSiteIds, getSiteIdsByMal, searchAnilist, SiteIds } from './utils/mapper';
-import { cacheStats } from './utils/cache';
+import { cacheStats, withInflight } from './utils/cache';
 import { resolveEmbed } from './resolvers/megacloud';
 
 import { getHeavenEpisodes, getHeavenServers, getHeavenStream } from './scrapers/animeheaven';
@@ -96,13 +96,16 @@ async function resolveAlId(anilistId?: string, malId?: string): Promise<number |
 // down/unreachable and we only have a malId, falls back to the MAL-only
 // path so search -> info -> episodes keeps working end to end.
 async function resolveSiteIds(anilistId?: string, malId?: string): Promise<SiteIds | null> {
-  const alId = await resolveAlId(anilistId, malId);
-  if (alId) {
-    const info = await getSiteIds(alId);
-    if (info) return info;
-  }
-  if (malId) return getSiteIdsByMal(parseInt(malId));
-  return null;
+  const key = `siteids:resolve:${anilistId || ''}:${malId || ''}`;
+  return withInflight(key, async () => {
+    const alId = await resolveAlId(anilistId, malId);
+    if (alId) {
+      const info = await getSiteIds(alId);
+      if (info) return info;
+    }
+    if (malId) return getSiteIdsByMal(parseInt(malId));
+    return null;
+  }, 'site ID mapping');
 }
 
 async function fetchEpisodes(source: Source, siteIds: any, overrides: { heavenId?: string } = {}): Promise<{ episodes: any[]; siteId: string; error?: string }> {
