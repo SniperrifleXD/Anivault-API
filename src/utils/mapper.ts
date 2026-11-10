@@ -6,6 +6,8 @@ import { findAnikotoSlug } from '../scrapers/anikoto';
 import { findDesidubSlug } from '../scrapers/desidub';
 import { getAnimeDetails } from '../scrapers/mal';
 
+export type MappingSource = 'animeheaven' | 'anikoto' | 'desidub' | 'megaplay';
+
 export interface SiteIds {
   anilistId: number | null;
   malId: number | null;
@@ -109,24 +111,45 @@ async function getAnilistTitle(anilistId: number): Promise<{ title: string; altT
   };
 }
 
-// AniList ID → metadata + site-specific IDs
-export async function getSiteIds(anilistId: number): Promise<SiteIds | null> {
-  const cacheKey = `siteids:${anilistId}`;
+// Enrich only the provider requested by a playback route. The no-source
+// path intentionally keeps the legacy full mapping behavior used by /info.
+async function enrichForSource(result: SiteIds, source?: MappingSource): Promise<SiteIds> {
+  if (source === 'animeheaven') {
+    await enrichAnimeHeaven(result, result.altTitle);
+  } else if (source === 'anikoto') {
+    await enrichAnikoto(result, result.altTitle);
+  } else if (source === 'desidub') {
+    await enrichDesidub(result, result.altTitle);
+  } else if (!source) {
+    // The legacy full-mapping path has independent provider lookups. Run
+    // them concurrently rather than serializing three unrelated scrapers.
+    await Promise.all([
+      enrichAnimeHeaven(result, result.altTitle),
+      enrichAnikoto(result, result.altTitle),
+      enrichDesidub(result, result.altTitle),
+    ]);
+  }
+  // MegaPlay needs only AniList/MAL metadata, not a site slug.
+  return result;
+}
+
+// AniList ID → metadata + requested site-specific ID(s).
+// Source-scoped cache entries prevent a partial lookup for one provider from
+// being mistaken for a complete mapping by /info or another provider.
+export async function getSiteIds(anilistId: number, source?: MappingSource): Promise<SiteIds | null> {
+  const cacheKey = source ? `siteids:${anilistId}:${source}` : `siteids:${anilistId}`;
   const cached = cacheGet<SiteIds>(cacheKey);
   if (cached) {
-    const wasMissingAnimeHeaven = !cached.siteIds.animeheaven;
-    const wasMissingAnikoto = !cached.siteIds.anikoto;
-    const wasMissingDesidub = !cached.siteIds.desidub;
-    const enriched = await enrichDesidub(await enrichAnikoto(await enrichAnimeHeaven(cached, cached.altTitle), cached.altTitle), cached.altTitle);
-    if ((wasMissingAnimeHeaven && enriched.siteIds.animeheaven) || (wasMissingAnikoto && enriched.siteIds.anikoto) || (wasMissingDesidub && enriched.siteIds.desidub)) {
-      cacheSet(cacheKey, enriched);
+    const before = { ...cached.siteIds };
+    await enrichForSource(cached, source);
+    if (Object.keys(cached.siteIds).some((key) => cached.siteIds[key as keyof SiteIds['siteIds']] !== before[key as keyof SiteIds['siteIds']])) {
+      cacheSet(cacheKey, cached);
     }
-    return enriched;
+    return cached;
   }
 
-  // Build result shell using AniList (always reliable for title + malId)
+  // Build result shell using AniList for the canonical title and MAL ID.
   const alInfo = await getAnilistTitle(anilistId).catch(() => ({ title: 'Unknown', altTitle: null, malId: null }));
-
   const result: SiteIds = {
     anilistId,
     malId: alInfo.malId,
@@ -135,30 +158,31 @@ export async function getSiteIds(anilistId: number): Promise<SiteIds | null> {
     siteIds: {},
   };
 
-  // Try Anify for site mappings
-  try {
-    const res = await axios.get(`https://api.anify.tv/info/${anilistId}`, {
-      params: { fields: 'mappings' },
-      timeout: 8000,
-    });
-    const mappings: any[] = res.data?.mappings ?? [];
-    for (const m of mappings) {
-      if (m.providerId === 'zoro')      result.siteIds.zoro = m.id;
-      if (m.providerId === 'gogoanime') result.siteIds.gogoanime = m.id;
-      
-      if (m.providerId === 'mal' && !result.malId) result.malId = parseInt(m.id);
+  // Anify only supplies the legacy Zoro/GoGoAnime mappings. None of the
+  // source-specific playback routes below consume those IDs, so avoid its
+  // network request entirely unless the caller explicitly asks for a full
+  // mapping (the existing /info contract).
+  if (!source) {
+    try {
+      const res = await axios.get(`https://api.anify.tv/info/${anilistId}`, {
+        params: { fields: 'mappings' },
+        timeout: 8000,
+      });
+      const mappings: any[] = res.data?.mappings ?? [];
+      for (const mapping of mappings) {
+        if (mapping.providerId === 'zoro') result.siteIds.zoro = mapping.id;
+        if (mapping.providerId === 'gogoanime') result.siteIds.gogoanime = mapping.id;
+        if (mapping.providerId === 'mal' && !result.malId) result.malId = parseInt(mapping.id);
+      }
+    } catch {
+      // Anify is optional; direct provider lookup remains available.
     }
-  } catch {
-    // Anify down or missing — fall through to direct scraper fallbacks below
   }
 
-  await enrichAnimeHeaven(result, result.altTitle);
-  await enrichAnikoto(result, result.altTitle);
-  await enrichDesidub(result, result.altTitle);
+  await enrichForSource(result, source);
 
-  // If still no zoro ID, try a slug guess (title-anilistId format common on HiAnime clones)
-  // This is a heuristic and may not always work
-  if (!result.siteIds.zoro && result.title !== 'Unknown') {
+  // Preserve the legacy Zoro fallback only for full mapping requests.
+  if (!source && !result.siteIds.zoro && result.title !== 'Unknown') {
     const slug = result.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
     result.siteIds.zoro = `${slug}-${anilistId}`;
   }
@@ -167,36 +191,27 @@ export async function getSiteIds(anilistId: number): Promise<SiteIds | null> {
   return result;
 }
 
-// AniList-free fallback: build SiteIds from a MAL ID alone (title comes from
-// your own MAL scraper instead of AniList's getAnilistTitle). Used when
-// malToAnilist can't resolve an AniList ID (AniList down/blocked). Note:
-// zoro/gogoanime via Anify both key off anilistId, so
-// those stay unavailable here -- everything keyed off title (animeheaven,
-// anikoto, desidub) still works normally.
-export async function getSiteIdsByMal(malId: number): Promise<SiteIds | null> {
-  const cacheKey = `siteids:mal:${malId}`;
+// AniList-free fallback: build SiteIds from a MAL ID alone. Only the
+// requested provider is searched, avoiding unrelated scraper work.
+export async function getSiteIdsByMal(malId: number, source?: MappingSource): Promise<SiteIds | null> {
+  const cacheKey = source ? `siteids:mal:${malId}:${source}` : `siteids:mal:${malId}`;
   const cached = cacheGet<SiteIds>(cacheKey);
   if (cached) {
-    const wasMissingAnimeHeaven = !cached.siteIds.animeheaven;
-    const wasMissingAnikoto = !cached.siteIds.anikoto;
-    const wasMissingDesidub = !cached.siteIds.desidub;
-    const enriched = await enrichDesidub(await enrichAnikoto(await enrichAnimeHeaven(cached, cached.altTitle), cached.altTitle), cached.altTitle);
-    if ((wasMissingAnimeHeaven && enriched.siteIds.animeheaven) || (wasMissingAnikoto && enriched.siteIds.anikoto) || (wasMissingDesidub && enriched.siteIds.desidub)) {
-      cacheSet(cacheKey, enriched);
+    const before = { ...cached.siteIds };
+    await enrichForSource(cached, source);
+    if (Object.keys(cached.siteIds).some((key) => cached.siteIds[key as keyof SiteIds['siteIds']] !== before[key as keyof SiteIds['siteIds']])) {
+      cacheSet(cacheKey, cached);
     }
-    return enriched;
+    return cached;
   }
 
   const details = await getAnimeDetails(malId).catch(() => null);
   if (!details) return null;
 
-  // details.title is MAL's romaji/native title; details.titleEnglish is the
-  // localized one. Anikoto (and most streaming clones) index by the English
-  // title, so that has to be tried too, not just whichever MAL calls
-  // "the" title.
+  // MAL's native title is often romaji; preserve the English alternative
+  // because Anikoto and other providers commonly index localized titles.
   const romajiTitle = details.title || null;
   const englishTitle = details.titleEnglish || null;
-
   const result: SiteIds = {
     anilistId: null,
     malId,
@@ -205,10 +220,7 @@ export async function getSiteIdsByMal(malId: number): Promise<SiteIds | null> {
     siteIds: {},
   };
 
-  await enrichAnimeHeaven(result, result.altTitle);
-  await enrichAnikoto(result, result.altTitle);
-  await enrichDesidub(result, result.altTitle);
-
+  await enrichForSource(result, source);
   cacheSet(cacheKey, result);
   return result;
 }
