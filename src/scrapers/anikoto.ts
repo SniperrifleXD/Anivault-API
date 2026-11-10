@@ -4,7 +4,7 @@ import { inspect } from 'util';
 import * as crypto from 'crypto';
 import * as vm from 'vm';
 import { makeClient, makeAjaxClient } from '../utils/fetch';
-import { cacheGet, cacheSet, withInflight } from '../utils/cache';
+import { cacheGet, cacheSet, sharedCacheGet, sharedCacheSet, withInflight } from '../utils/cache';
 
 // ══════════════════════════════════════════════════════════════
 // ANIKOTO.NET — HiAnime/Zoro-style clone
@@ -20,6 +20,7 @@ import { cacheGet, cacheSet, withInflight } from '../utils/cache';
 // listed among Anikoto's verified domains and caused every search/AJAX lookup to miss.
 // Set ANIKOTO_BASE_URL to an official mirror if the primary domain is unavailable.
 const BASE = (process.env.ANIKOTO_BASE_URL || 'https://anikototv.to').replace(/\/+$/, '');
+const SERVER_LIST_CACHE_TTL_SECONDS = Math.max(30, parseInt(process.env.CACHE_TTL_SERVER_LIST || '900', 10) || 900);
 const http = makeClient(BASE, BASE + '/');
 const ajax = makeAjaxClient(BASE, BASE + '/');
 
@@ -374,46 +375,67 @@ async function getAnikotoServersUncoalesced(episodeId: string): Promise<AnikotoS
   const servers: AnikotoServer[] = [];
 
   if (dataIds) {
-    const startedAt = Date.now();
-    try {
-      const res = await ajax.get('/ajax/server/list', { params: { servers: dataIds } });
-      const html = res.data?.result || (typeof res.data === 'string' ? res.data : '');
-      const $ = cheerio.load(html);
+    const cacheKey = `anikoto:servers:${slug}:${epNumStr}:${dataIds}`;
+    const cachedServers = await sharedCacheGet<AnikotoServer[]>(cacheKey, SERVER_LIST_CACHE_TTL_SECONDS);
 
-      $('.server, li').each((_, el) => {
-        const $el = $(el);
-        const linkId = $el.attr('data-link-id');
-        if (!linkId) return;
-
-        const typeLabel = $el.closest('.type').find('label, .name').text().trim().toLowerCase();
-        const name = $el.text().trim() || 'Server';
-        const svId = $el.attr('data-sv-id') || '';
-        const type: AnikotoServer['type'] =
-          typeLabel.includes('dub') ? 'dub' : typeLabel.includes('raw') ? 'raw' : 'sub';
-
-        servers.push({
-          name,
-          sourceId: `${slug}::${epNumStr}::reg::${linkId}::${svId}::${encodeURIComponent(name)}`,
-          type,
-        });
-      });
-
-      log('getAnikotoServers: /ajax/server/list completed', {
+    if (cachedServers?.length) {
+      servers.push(...cachedServers);
+      log('getAnikotoServers: shared server-list cache hit', {
         slug,
         episode: epNumStr,
-        durationMs: Date.now() - startedAt,
-        serverCount: servers.length,
+        serverCount: cachedServers.length,
       });
-      if (servers.length === 0) {
-        log('getAnikotoServers: /ajax/server/list returned no parseable .server/li elements', { slug, dataIds, htmlSnippet: String(html).slice(0, 300) });
+    } else {
+      const startedAt = Date.now();
+      const discovered: AnikotoServer[] = [];
+      try {
+        const res = await ajax.get('/ajax/server/list', { params: { servers: dataIds } });
+        const html = res.data?.result || (typeof res.data === 'string' ? res.data : '');
+        const $ = cheerio.load(html);
+
+        $('.server, li').each((_, el) => {
+          const $el = $(el);
+          const linkId = $el.attr('data-link-id');
+          if (!linkId) return;
+
+          const typeLabel = $el.closest('.type').find('label, .name').text().trim().toLowerCase();
+          const name = $el.text().trim() || 'Server';
+          const svId = $el.attr('data-sv-id') || '';
+          const type: AnikotoServer['type'] =
+            typeLabel.includes('dub') ? 'dub' : typeLabel.includes('raw') ? 'raw' : 'sub';
+
+          discovered.push({
+            name,
+            sourceId: `${slug}::${epNumStr}::reg::${linkId}::${svId}::${encodeURIComponent(name)}`,
+            type,
+          });
+        });
+
+        log('getAnikotoServers: /ajax/server/list completed', {
+          slug,
+          episode: epNumStr,
+          durationMs: Date.now() - startedAt,
+          serverCount: discovered.length,
+        });
+        if (discovered.length === 0) {
+          log('getAnikotoServers: /ajax/server/list returned no parseable .server/li elements', { slug, dataIds, htmlSnippet: String(html).slice(0, 300) });
+        } else {
+          await sharedCacheSet(cacheKey, discovered, SERVER_LIST_CACHE_TTL_SECONDS);
+          servers.push(...discovered);
+          log('getAnikotoServers: shared server-list cache populated', {
+            slug,
+            episode: epNumStr,
+            ttlSeconds: SERVER_LIST_CACHE_TTL_SECONDS,
+          });
+        }
+      } catch (err) {
+        log('getAnikotoServers: /ajax/server/list threw', {
+          slug,
+          dataIds,
+          durationMs: Date.now() - startedAt,
+          ...errInfo(err),
+        });
       }
-    } catch (err) {
-      log('getAnikotoServers: /ajax/server/list threw', {
-        slug,
-        dataIds,
-        durationMs: Date.now() - startedAt,
-        ...errInfo(err),
-      });
     }
   }
 
@@ -551,20 +573,28 @@ async function resolveKiwi(malId: string, epNum: string, timestamp: string, type
         }
       }
 
-      // Path B: no valid server code, but a direct URL was found (e.g. the
-      // `download` shortlink) — run it through the normal extractor chain in
-      // case it happens to resolve to a known megacloud/megaplay host.
+      // Kiwi's current mapper response exposes AnimePahe download shortlinks,
+      // not playable embed URLs. pahe.nekostream.site hands off to testpahe and
+      // then a Kwik file page; that flow requires a browser/Cloudflare clearance
+      // and a CSRF form POST. Do not feed a download URL into video embed extractors.
       if (directUrl) {
-        log('kiwi: no valid server code, trying direct link through extractor chain', { directUrl });
-        const resolved = await resolveAnikotoEmbed(directUrl, 'Kiwi Stream').catch((err) => {
-          log('kiwi: direct link resolution threw', errInfo(err));
-          return null;
-        });
-        if (resolved) {
-          log(`kiwi: resolved via ${mapperBase} (direct-link path)`, { directUrl, m3u8: resolved.m3u8 });
-          return resolved;
+        if (directUrl.includes('nekostream.site')) {
+          log('kiwi: mapper returned a download-only AnimePahe shortlink; it is not a playable stream URL', {
+            directUrl,
+            resolution: 'requires the separate Kwik download flow and browser clearance',
+          });
+        } else {
+          log('kiwi: no valid server code, trying non-Kiwi direct URL through extractor chain', { directUrl });
+          const resolved = await resolveAnikotoEmbed(directUrl, 'Kiwi Stream').catch((err) => {
+            log('kiwi: direct link resolution threw', errInfo(err));
+            return null;
+          });
+          if (resolved) {
+            log(`kiwi: resolved via ${mapperBase} (direct-link path)`, { directUrl, m3u8: resolved.m3u8 });
+            return resolved;
+          }
+          log('kiwi: direct link did not resolve via any known extractor', { directUrl });
         }
-        log('kiwi: direct link did not resolve via any known extractor', { directUrl });
       }
 
       if (!serverCode && !directUrl) {
