@@ -94,7 +94,7 @@ function inspectStreamKey(key: string): StreamKeyValidation {
       return { ok: false, reason: 'expired' };
     }
 
-    return { ok: true, directUrl: target.href, referer: (payload.referer as string) || '', reason: null};
+    return { ok: true, directUrl: target.href, referer: (payload.referer as string) || '' };
   } catch {
     return { ok: false, reason: 'invalid_token' };
   }
@@ -699,8 +699,8 @@ router.get('/watch/v2/anikoto/:anikotoId/:ep/:type', (req: Request, res: Respons
 
 router.get('/proxy/hls/:streamKey', async (req: Request, res: Response) => {
   const validation = inspectStreamKey(req.params.streamKey);
-  if (!validation.ok) {
-    return res.status(403).json({ error: 'Invalid or expired stream key', reason: validation?.reason });
+  if (validation.ok === false) {
+    return res.status(403).json({ error: 'Invalid or expired stream key', reason: validation.reason });
   }
 
   const url = validation.directUrl;
