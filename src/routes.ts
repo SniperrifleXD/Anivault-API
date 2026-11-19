@@ -689,11 +689,10 @@ router.get('/proxy/hls/:streamKey', async (req: Request, res: Response) => {
   }
 
   try {
-    const isManifestUrl = /\\.m3u8(?:\\?|$)/i.test(url);
+    const isManifestUrl = /\.m3u8(?:\?|$)/i.test(url);
     const upstream = await axios.get(url, {
       responseType: 'arraybuffer',
       timeout: 15000,
-      httpsAgent: new https.Agent({ rejectUnauthorized: false }),
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
         Accept: '*/*',
@@ -731,9 +730,9 @@ router.get('/proxy/hls/:streamKey', async (req: Request, res: Response) => {
       if (value) res.setHeader(header, value);
     }
 
-    if (/\\.ts(?:\\?|$)/i.test(url) || /mp2t/i.test(contentType)) {
+    if (/\.ts(?:\?|$)/i.test(url) || /mp2t/i.test(contentType)) {
       res.type('video/mp2t');
-    } else if (/\\.(?:m4s|mp4)(?:\\?|$)/i.test(url) || /mp4/i.test(contentType)) {
+    } else if (/\.(?:m4s|mp4)(?:\?|$)/i.test(url) || /mp4/i.test(contentType)) {
       res.type('video/mp4');
     } else {
       res.type(contentType || 'application/octet-stream');
