@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import axios from 'axios';
 import https from 'https';
+import crypto from 'node:crypto';
 import { malToAnilist, getSiteIds, getSiteIdsByMal, searchAnilist, SiteIds, MappingSource } from './utils/mapper';
 import { cacheStats, withInflight } from './utils/cache';
 import { resolveEmbed } from './resolvers/megacloud';
@@ -30,11 +31,90 @@ function publicBase(req: Request): string {
   return `${proto}://${req.get('host')}`;
 }
 
-export function proxiedHlsUrl(req: Request, url: string, ref?: string): string {
-  const refParam = ref ? `&ref=${encodeURIComponent(ref)}` : '';
-  return `${publicBase(req)}/api/proxy/hls?url=${encodeURIComponent(url)}${refParam}`;
+const STREAM_KEY_SECRET = process.env.STREAM_KEY_SECRET || process.env.STREAM_SIGN_SECRET || '';
+const STREAM_KEY_TTL_MS = Number.parseInt(process.env.STREAM_KEY_TTL_MS || '', 10) || 6 * 60 * 60 * 1000;
+
+function streamKeyHmac(payload: string): string {
+  if (!STREAM_KEY_SECRET) throw new Error('STREAM_KEY_SECRET is required for signed HLS proxy URLs');
+  return crypto.createHmac('sha256', STREAM_KEY_SECRET).update(payload).digest('hex');
 }
 
+function toStreamKey(directUrl: string, referer = '', expiresAt?: number): string {
+  const payload = JSON.stringify({
+    directUrl,
+    referer,
+    ...(expiresAt ? { exp: expiresAt } : {}),
+    nonce: crypto.randomBytes(8).toString('hex'),
+  });
+  return Buffer.from(JSON.stringify({ payload, sig: streamKeyHmac(payload) })).toString('base64url');
+}
+
+type StreamKeyValidation =
+  | { ok: true; directUrl: string; referer: string }
+  | { ok: false; reason: string };
+
+function inspectStreamKey(key: string): StreamKeyValidation {
+  if (!key) return { ok: false, reason: 'empty' };
+  if (key.length > 16_384) return { ok: false, reason: 'too_long' };
+
+  try {
+    const decoded = JSON.parse(Buffer.from(key, 'base64url').toString('utf8')) as {
+      payload?: unknown;
+      sig?: unknown;
+    };
+    if (typeof decoded.payload !== 'string' || typeof decoded.sig !== 'string') {
+      return { ok: false, reason: 'invalid_token_shape' };
+    }
+
+    const expected = streamKeyHmac(decoded.payload);
+    const supplied = decoded.sig.toLowerCase();
+    const expectedBuffer = Buffer.from(expected);
+    const suppliedBuffer = Buffer.from(supplied);
+    if (suppliedBuffer.length !== expectedBuffer.length ||
+        !crypto.timingSafeEqual(suppliedBuffer, expectedBuffer)) {
+      return { ok: false, reason: 'invalid_signature' };
+    }
+
+    const payload = JSON.parse(decoded.payload) as {
+      directUrl?: unknown;
+      referer?: unknown;
+      exp?: unknown;
+    };
+    if (typeof payload.directUrl !== 'string' || !/^https?:\\/\\//i.test(payload.directUrl)) {
+      return { ok: false, reason: 'invalid_url' };
+    }
+    const target = new URL(payload.directUrl);
+    if (target.protocol !== 'http:' && target.protocol !== 'https:') {
+      return { ok: false, reason: 'invalid_url' };
+    }
+    if (payload.referer !== undefined && typeof payload.referer !== 'string') {
+      return { ok: false, reason: 'invalid_referer' };
+    }
+    if (typeof payload.exp === 'number' && payload.exp <= Math.floor(Date.now() / 1000)) {
+      return { ok: false, reason: 'expired' };
+    }
+
+    return { ok: true, directUrl: target.href, referer: (payload.referer as string) || '' };
+  } catch {
+    return { ok: false, reason: 'invalid_token' };
+  }
+}
+
+export function proxiedHlsUrl(req: Request, url: string, ref?: string): string {
+  const directUrl = new URL(url);
+  if (directUrl.protocol !== 'http:' && directUrl.protocol !== 'https:') {
+    throw new Error('HLS URL must use HTTP or HTTPS');
+  }
+
+  const base = new URL(publicBase(req));
+  if (directUrl.origin === base.origin && directUrl.pathname.startsWith('/api/proxy/hls/')) {
+    return directUrl.href;
+  }
+
+  const expiresAt = Math.floor((Date.now() + STREAM_KEY_TTL_MS) / 1000);
+  const key = toStreamKey(directUrl.href, ref || '', expiresAt);
+  return new URL(`/api/proxy/hls/${key}`, base).href;
+}
 function proxiedVideoUrl(req: Request, url: string): string {
   return `${publicBase(req)}/api/proxy/video?url=${encodeURIComponent(url)}`;
 }
@@ -46,49 +126,28 @@ export function proxiedSubtitleUrl(req: Request, url: string, ref?: string): str
 
 function rewriteHlsPlaylist(req: Request, body: string, sourceUrl: string, ref?: string): string {
   const base = new URL(sourceUrl);
+  const proxyUri = (uri: string) => proxiedHlsUrl(req, new URL(uri, base).href, ref);
 
-  // Rewrite a single URI value (relative or absolute) → proxy URL
-  const proxyUri = (uri: string) => proxiedHlsUrl(req, new URL(uri, base).toString(), ref);
+  return body.split(/\\r?\\n/).map((line) => {
+    const trimmed = line.trim();
+    if (!trimmed) return line;
 
-  let hasDefaultAudio = false;
-  const lines = body.split(/\r?\n/);
-
-  // Check if any audio track has DEFAULT=YES
-  for (const line of lines) {
-    if (line.includes('#EXT-X-MEDIA:TYPE=AUDIO') && line.includes('DEFAULT=YES')) {
-      hasDefaultAudio = true;
-      break;
+    if (trimmed.startsWith('#')) {
+      // Rewrite quoted and unquoted URI attributes, including KEY, MAP,
+      // MEDIA, I-FRAME-STREAM-INF and other URI-bearing HLS directives.
+      return line.replace(/(^|,)\\s*URI=(?:"([^"]*)"|'([^']*)'|([^,\\s]*))/gi,
+        (_match, prefix: string, doubleQuoted?: string, singleQuoted?: string, bare?: string) => {
+          const uri = doubleQuoted ?? singleQuoted ?? bare;
+          if (!uri) return _match;
+          const rewritten = proxyUri(uri);
+          if (doubleQuoted !== undefined) return `${prefix}URI="${rewritten}"`;
+          if (singleQuoted !== undefined) return `${prefix}URI='${rewritten}'`;
+          return `${prefix}URI="${rewritten}"`;
+        });
     }
-  }
 
-  let firstAudioMarked = false;
-
-  return lines
-    .map((line) => {
-      const trimmed = line.trim();
-      if (!trimmed) return line;
-
-      // If this is an audio track and no audio has DEFAULT=YES, promote the first one to DEFAULT=YES,AUTOSELECT=YES
-      let processedLine = line;
-      if (!hasDefaultAudio && !firstAudioMarked && trimmed.includes('#EXT-X-MEDIA:TYPE=AUDIO')) {
-        processedLine = processedLine
-          .replace(/DEFAULT=NO/g, 'DEFAULT=YES')
-          .replace(/AUTOSELECT=NO/g, 'AUTOSELECT=YES');
-        firstAudioMarked = true;
-      }
-
-      // Rewrite all URI="..." attributes inside any HLS directive line
-      // Covers: #EXT-X-KEY, #EXT-X-MEDIA, #EXT-X-MAP, #EXT-X-I-FRAME-STREAM-INF, etc.
-      if (processedLine.trim().startsWith('#') && processedLine.includes('URI=')) {
-        return processedLine.replace(/URI="([^"]+)"/g, (_m, uri) => `URI="${proxyUri(uri)}"`);
-      }
-
-      if (processedLine.trim().startsWith('#')) return processedLine;
-
-      // Non-# lines are segment/variant URLs — proxy them directly
-      return proxyUri(trimmed);
-    })
-    .join('\n');
+    return proxyUri(trimmed);
+  }).join('\\n');
 }
 
 async function resolveAlId(anilistId?: string, malId?: string): Promise<number | null> {
@@ -616,75 +675,76 @@ router.get('/watch/v2/anikoto/:anikotoId/:ep/:type', (req: Request, res: Respons
   watchHandler(req, res, req.params.anikotoId)
 );
 
-router.get('/proxy/hls', async (req: Request, res: Response) => {
-  const url = req.query.url as string | undefined;
-  const ref = req.query.ref as string | undefined;
-  if (!url) return res.status(400).json({ error: 'Missing ?url=' });
-  if (!/^https?:\/\//i.test(url)) return res.status(400).json({ error: '?url must be absolute http(s)' });
+router.get('/proxy/hls/:streamKey', async (req: Request, res: Response) => {
+  const { streamKey } = req.params;
+  const validation = inspectStreamKey(streamKey);
+  if (!validation.ok) {
+    return res.status(403).json({ error: 'Invalid or expired stream key', reason: validation.reason });
+  }
 
-  // Not every source's embedResult carries a referer; if none was supplied,
-  // omit the header entirely instead of guessing — most CDNs tolerate a
-  // missing Referer far better than a wrong one.
-  let referer: string | undefined;
+  const { directUrl: url, referer } = validation;
   let origin: string | undefined;
-  if (ref && /^https?:\/\//i.test(ref)) {
-    referer = ref;
-    try {
-      origin = new URL(ref).origin;
-    } catch {
-      origin = undefined;
-    }
+  if (referer) {
+    try { origin = new URL(referer).origin; } catch { /* invalid optional referer is ignored */ }
   }
 
   try {
+    const isManifestUrl = /\\.m3u8(?:\\?|$)/i.test(url);
     const upstream = await axios.get(url, {
       responseType: 'arraybuffer',
       timeout: 15000,
       httpsAgent: new https.Agent({ rejectUnauthorized: false }),
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
-        'Accept': '*/*',
+        Accept: '*/*',
         'Accept-Language': 'en-US,en;q=0.9',
         ...(referer ? { Referer: referer } : {}),
         ...(origin ? { Origin: origin } : {}),
-        ...(req.headers.range ? { Range: req.headers.range } : {}),
+        ...(!isManifestUrl && req.headers.range ? { Range: req.headers.range } : {}),
       },
       validateStatus: (status) => (status >= 200 && status < 300) || status === 206,
     });
 
     const contentType = String(upstream.headers['content-type'] ?? '');
     const body = Buffer.from(upstream.data);
+    const isManifest = isManifestUrl || /mpegurl/i.test(contentType);
 
     res.status(upstream.status);
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Cache-Control', 'public, max-age=30');
+    res.setHeader('Access-Control-Expose-Headers', 'Content-Range, Accept-Ranges, Content-Length');
+    res.setHeader('Cache-Control', 'no-store');
 
-    for (const h of ['accept-ranges', 'content-range', 'content-length', 'etag', 'last-modified']) {
-      const val = upstream.headers[h];
-      if (val) res.setHeader(h, val);
-    }
-
-    if (url.includes('.m3u8') || contentType.includes('mpegurl')) {
+    if (isManifest) {
       const text = body.toString('utf8');
-      if (!text.trim().startsWith('#EXTM3U')) {
-        return res.status(502).json({ error: 'Upstream did not return a valid m3u8 playlist', body: text.slice(0, 300) });
+      if (!text.trimStart().startsWith('#EXTM3U')) {
+        return res.status(502).json({ error: 'Upstream did not return a valid HLS manifest' });
       }
+      res.removeHeader('Content-Length');
+      res.removeHeader('Content-Range');
+      res.removeHeader('Accept-Ranges');
       res.type('application/vnd.apple.mpegurl');
-      return res.send(rewriteHlsPlaylist(req, text, url, ref));
+      return res.send(rewriteHlsPlaylist(req, text, url, referer));
     }
 
-    // Set correct video MIME types for segments so HLS.js demuxer can process them reliably
-    if (url.includes('.ts') || contentType.includes('mp2t')) {
+    for (const header of ['accept-ranges', 'content-range', 'content-length', 'etag', 'last-modified']) {
+      const value = upstream.headers[header];
+      if (value) res.setHeader(header, value);
+    }
+
+    if (/\\.ts(?:\\?|$)/i.test(url) || /mp2t/i.test(contentType)) {
       res.type('video/mp2t');
-    } else if (url.includes('.m4s') || url.includes('.mp4') || url.includes('.woff') || contentType.includes('mp4')) {
+    } else if (/\\.(?:m4s|mp4)(?:\\?|$)/i.test(url) || /mp4/i.test(contentType)) {
       res.type('video/mp4');
     } else {
       res.type(contentType || 'application/octet-stream');
     }
 
     return res.send(body);
-  } catch (e: any) {
-    return res.status(e?.response?.status || 502).json({ error: 'HLS proxy failed', detail: e?.message || String(e) });
+  } catch (error: any) {
+    return res.status(error?.response?.status || 502).json({
+      error: 'HLS proxy failed',
+      detail: error?.message || String(error),
+    });
   }
 });
 
