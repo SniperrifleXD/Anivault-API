@@ -1,6 +1,5 @@
 import { Router, Request, Response } from 'express';
 import axios from 'axios';
-import https from 'https';
 import crypto from 'node:crypto';
 import { malToAnilist, getSiteIds, getSiteIdsByMal, searchAnilist, SiteIds, MappingSource } from './utils/mapper';
 import { cacheStats, withInflight } from './utils/cache';
