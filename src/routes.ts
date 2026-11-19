@@ -94,7 +94,7 @@ function inspectStreamKey(key: string): StreamKeyValidation {
       return { ok: false, reason: 'expired' };
     }
 
-    return { ok: true, directUrl: target.href, referer: (payload.referer as string) || '' };
+    return { ok: true, directUrl: target.href, referer: (payload.referer as string) || '', reason: null};
   } catch {
     return { ok: false, reason: 'invalid_token' };
   }
