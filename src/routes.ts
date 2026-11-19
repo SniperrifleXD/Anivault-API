@@ -1876,7 +1876,7 @@ router.get('/health', (_req, res) => {
   const stats = cacheStats();
   const process_: { ok: boolean; label: string; detail: string; badges: { label: string; value: string }[]; critical: boolean } = {
     ok: true,
-    label: 'Scraper Process',
+    label: 'Scraper Process v2',
     detail: 'API process is running and serving requests.',
     badges: [{ label: 'Uptime', value: `${Math.floor(process.uptime() / 60)}m` }],
     critical: true,
