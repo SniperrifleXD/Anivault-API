@@ -700,7 +700,7 @@ router.get('/watch/v2/anikoto/:anikotoId/:ep/:type', (req: Request, res: Respons
 router.get('/proxy/hls/:streamKey', async (req: Request, res: Response) => {
   const validation = inspectStreamKey(req.params.streamKey);
   if (!validation.ok) {
-    return res.status(403).json({ error: 'Invalid or expired stream key', reason: validation.reason });
+    return res.status(403).json({ error: 'Invalid or expired stream key', reason: validation?.reason });
   }
 
   const url = validation.directUrl;
