@@ -20,6 +20,10 @@ const limiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many requests, please slow down.' },
+  // Signed HLS stream keys are validated by the proxy route itself. HLS
+  // playlists and segments generate many requests during normal playback,
+  // so do not apply the general API rate limit to this endpoint.
+  skip: (req) => req.path.startsWith('/proxy/hls/'),
 });
 app.use('/api', limiter);
 
