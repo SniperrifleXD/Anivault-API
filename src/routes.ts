@@ -80,7 +80,7 @@ function inspectStreamKey(key: string): StreamKeyValidation {
       referer?: unknown;
       exp?: unknown;
     };
-    if (typeof payload.directUrl !== 'string' || !/^https?:\\/\\//i.test(payload.directUrl)) {
+    if (typeof payload.directUrl !== 'string' || !/^https?:\/\//i.test(payload.directUrl)) {
       return { ok: false, reason: 'invalid_url' };
     }
     const target = new URL(payload.directUrl);
@@ -128,14 +128,14 @@ function rewriteHlsPlaylist(req: Request, body: string, sourceUrl: string, ref?:
   const base = new URL(sourceUrl);
   const proxyUri = (uri: string) => proxiedHlsUrl(req, new URL(uri, base).href, ref);
 
-  return body.split(/\\r?\\n/).map((line) => {
+  return body.split(/\r?\n/).map((line) => {
     const trimmed = line.trim();
     if (!trimmed) return line;
 
     if (trimmed.startsWith('#')) {
       // Rewrite quoted and unquoted URI attributes, including KEY, MAP,
       // MEDIA, I-FRAME-STREAM-INF and other URI-bearing HLS directives.
-      return line.replace(/(^|,)\\s*URI=(?:"([^"]*)"|'([^']*)'|([^,\\s]*))/gi,
+      return line.replace(/(^|,)\s*URI=(?:"([^"]*)"|'([^']*)'|([^,\s]*))/gi,
         (_match, prefix: string, doubleQuoted?: string, singleQuoted?: string, bare?: string) => {
           const uri = doubleQuoted ?? singleQuoted ?? bare;
           if (!uri) return _match;
@@ -147,7 +147,7 @@ function rewriteHlsPlaylist(req: Request, body: string, sourceUrl: string, ref?:
     }
 
     return proxyUri(trimmed);
-  }).join('\\n');
+  }).join('\n');
 }
 
 async function resolveAlId(anilistId?: string, malId?: string): Promise<number | null> {
