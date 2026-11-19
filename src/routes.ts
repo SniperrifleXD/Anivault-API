@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import axios from 'axios';
 import https from 'https';
+import crypto from 'node:crypto';
 import { malToAnilist, getSiteIds, getSiteIdsByMal, searchAnilist, SiteIds, MappingSource } from './utils/mapper';
 import { cacheStats, withInflight } from './utils/cache';
 import { resolveEmbed } from './resolvers/megacloud';
@@ -30,9 +31,89 @@ function publicBase(req: Request): string {
   return `${proto}://${req.get('host')}`;
 }
 
+const STREAM_KEY_SECRET = process.env.STREAM_KEY_SECRET || process.env.STREAM_SIGN_SECRET || '';
+const STREAM_KEY_TTL_MS = Number.parseInt(process.env.STREAM_KEY_TTL_MS || '', 10) || 6 * 60 * 60 * 1000;
+
+function streamKeyHmac(payload: string): string {
+  if (!STREAM_KEY_SECRET) throw new Error('STREAM_KEY_SECRET is required for signed HLS proxy URLs');
+  return crypto.createHmac('sha256', STREAM_KEY_SECRET).update(payload).digest('hex');
+}
+
+function toStreamKey(directUrl: string, referer = '', expiresAt?: number): string {
+  const payload = JSON.stringify({
+    directUrl,
+    referer,
+    ...(expiresAt ? { exp: expiresAt } : {}),
+    nonce: crypto.randomBytes(8).toString('hex'),
+  });
+  return Buffer.from(JSON.stringify({ payload, sig: streamKeyHmac(payload) })).toString('base64url');
+}
+
+type StreamKeyValidation =
+  | { ok: true; directUrl: string; referer: string }
+  | { ok: false; reason: string };
+
+function inspectStreamKey(key: string): StreamKeyValidation {
+  if (!key) return { ok: false, reason: 'empty' };
+  if (key.length > 16_384) return { ok: false, reason: 'too_long' };
+
+  try {
+    const decoded = JSON.parse(Buffer.from(key, 'base64url').toString('utf8')) as {
+      payload?: unknown;
+      sig?: unknown;
+    };
+    if (typeof decoded.payload !== 'string' || typeof decoded.sig !== 'string') {
+      return { ok: false, reason: 'invalid_token_shape' };
+    }
+
+    const expected = streamKeyHmac(decoded.payload);
+    const supplied = decoded.sig.toLowerCase();
+    const expectedBuffer = Buffer.from(expected);
+    const suppliedBuffer = Buffer.from(supplied);
+    if (suppliedBuffer.length !== expectedBuffer.length ||
+        !crypto.timingSafeEqual(suppliedBuffer, expectedBuffer)) {
+      return { ok: false, reason: 'invalid_signature' };
+    }
+
+    const payload = JSON.parse(decoded.payload) as {
+      directUrl?: unknown;
+      referer?: unknown;
+      exp?: unknown;
+    };
+    if (typeof payload.directUrl !== 'string' || !/^https?:\/\//i.test(payload.directUrl)) {
+      return { ok: false, reason: 'invalid_url' };
+    }
+    const target = new URL(payload.directUrl);
+    if (target.protocol !== 'http:' && target.protocol !== 'https:') {
+      return { ok: false, reason: 'invalid_url' };
+    }
+    if (payload.referer !== undefined && typeof payload.referer !== 'string') {
+      return { ok: false, reason: 'invalid_referer' };
+    }
+    if (typeof payload.exp === 'number' && payload.exp <= Math.floor(Date.now() / 1000)) {
+      return { ok: false, reason: 'expired' };
+    }
+
+    return { ok: true, directUrl: target.href, referer: (payload.referer as string) || '' };
+  } catch {
+    return { ok: false, reason: 'invalid_token' };
+  }
+}
+
 export function proxiedHlsUrl(req: Request, url: string, ref?: string): string {
-  const refParam = ref ? `&ref=${encodeURIComponent(ref)}` : '';
-  return `${publicBase(req)}/api/proxy/hls?url=${encodeURIComponent(url)}${refParam}`;
+  const directUrl = new URL(url);
+  if (directUrl.protocol !== 'http:' && directUrl.protocol !== 'https:') {
+    throw new Error('HLS URL must use HTTP or HTTPS');
+  }
+
+  const base = new URL(publicBase(req));
+  if (directUrl.origin === base.origin && directUrl.pathname.startsWith('/api/proxy/hls/')) {
+    return directUrl.href;
+  }
+
+  const expiresAt = Math.floor((Date.now() + STREAM_KEY_TTL_MS) / 1000);
+  const key = toStreamKey(directUrl.href, ref || '', expiresAt);
+  return new URL(`/api/proxy/hls/${key}`, base).href;
 }
 
 function proxiedVideoUrl(req: Request, url: string): string {
@@ -616,11 +697,14 @@ router.get('/watch/v2/anikoto/:anikotoId/:ep/:type', (req: Request, res: Respons
   watchHandler(req, res, req.params.anikotoId)
 );
 
-router.get('/proxy/hls', async (req: Request, res: Response) => {
-  const url = req.query.url as string | undefined;
-  const ref = req.query.ref as string | undefined;
-  if (!url) return res.status(400).json({ error: 'Missing ?url=' });
-  if (!/^https?:\/\//i.test(url)) return res.status(400).json({ error: '?url must be absolute http(s)' });
+router.get('/proxy/hls/:streamKey', async (req: Request, res: Response) => {
+  const validation = inspectStreamKey(req.params.streamKey);
+  if (!validation.ok) {
+    return res.status(403).json({ error: 'Invalid or expired stream key', reason: validation.reason });
+  }
+
+  const url = validation.directUrl;
+  const ref = validation.referer;
 
   // Not every source's embedResult carries a referer; if none was supplied,
   // omit the header entirely instead of guessing — most CDNs tolerate a
