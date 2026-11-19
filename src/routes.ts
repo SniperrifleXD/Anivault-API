@@ -743,18 +743,23 @@ router.get('/proxy/hls/:streamKey', async (req: Request, res: Response) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Cache-Control', 'public, max-age=30');
 
-    for (const h of ['accept-ranges', 'content-range', 'content-length', 'etag', 'last-modified']) {
-      const val = upstream.headers[h];
-      if (val) res.setHeader(h, val);
-    }
-
     if (url.includes('.m3u8') || contentType.includes('mpegurl')) {
+      // The playlist body is rewritten below, so upstream representation
+      // headers (especially Content-Length and ETag) no longer describe it.
+      // Let Express calculate the length of the rewritten response.
       const text = body.toString('utf8');
       if (!text.trim().startsWith('#EXTM3U')) {
         return res.status(502).json({ error: 'Upstream did not return a valid m3u8 playlist', body: text.slice(0, 300) });
       }
       res.type('application/vnd.apple.mpegurl');
       return res.send(rewriteHlsPlaylist(req, text, url, ref));
+    }
+
+    // Segment bodies are not rewritten, so their upstream range and cache
+    // validators can be forwarded unchanged.
+    for (const h of ['accept-ranges', 'content-range', 'content-length', 'etag', 'last-modified']) {
+      const val = upstream.headers[h];
+      if (val) res.setHeader(h, val);
     }
 
     // Set correct video MIME types for segments so HLS.js demuxer can process them reliably
